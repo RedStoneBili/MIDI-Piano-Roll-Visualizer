@@ -5,12 +5,7 @@ from typing import Dict, List, Iterator, Optional
 
 
 class FastMidiReader:
-    """流式 MIDI 解析器。
-    - O(n_tracks) 内存
-    - 支持所有 channel message（note/program/CC/pitch/aftertouch/polytouch）
-    - 支持 set_tempo / end_of_track，跳过 sysex 和其余 meta
-    - 非标准 MIDI（data byte 越界）用 & 0x7F 容错
-    """
+    """按轨流式读取 MIDI 事件。"""
 
     def __init__(self, path: str):
         self._fd = open(path, 'rb')
@@ -59,12 +54,9 @@ class FastMidiReader:
         except Exception:
             pass
 
-    # ---------------- 第一遍：轻量统计 ----------------
+    # 第一遍：统计
     def scan_meta(self, progress_cb=None) -> Dict:
-        """扫描所有 track 收集统计。O(n_tracks) 内存，单遍。
-        返回：tempo_changes, note_count, pitch_hist, programs, channels_used,
-             tracks_used, min/max note, chord_count_est, first_note_abs_ticks
-        """
+        """扫描所有轨道，收集 tempo、音符、音色等统计。"""
         view = self._view
         n = len(self.track_ranges)
         tempo_changes = []
@@ -87,7 +79,7 @@ class FastMidiReader:
             track_has_notes = False
 
             while pos < e:
-                # --- VLQ delta-time 内联解码 ---
+                # VLQ delta-time
                 delta = 0
                 while pos < e:
                     b = view[pos]; pos += 1
@@ -108,7 +100,7 @@ class FastMidiReader:
 
                 hi = status & 0xF0
 
-                # --- meta ---
+                # meta
                 if status == 0xFF:
                     if pos >= e: break
                     meta_type = view[pos]; pos += 1
@@ -126,7 +118,7 @@ class FastMidiReader:
                     pos += length
                     continue
 
-                # --- sysex ---
+                # sysex
                 if status == 0xF0 or status == 0xF7:
                     length = 0
                     while pos < e:
@@ -137,7 +129,7 @@ class FastMidiReader:
                     pos += length
                     continue
 
-                # --- channel message ---
+                # channel 消息
                 if hi == 0x90 and pos + 1 < e:
                     note = view[pos] & 0x7F
                     velocity = view[pos + 1] & 0x7F
@@ -189,11 +181,9 @@ class FastMidiReader:
             'first_note_abs_ticks': first_note_abs_ticks or 0,
         }
 
-    # ---------------- 第二遍：流式产出事件 ----------------
+    # 第二遍：流式产出
     def iter_events(self) -> Iterator[Dict]:
-        """按绝对 tick 归并所有 track，流式产出事件。
-        每个事件 dict 至少含：abs_ticks, type, track
-        """
+        """按 tick 归并各轨道，流式产出事件。"""
         cursors = [_TrackCursor(self._view, s, e, i)
                    for i, (s, e) in enumerate(self.track_ranges)]
         for c in cursors:
@@ -346,6 +336,6 @@ class _TrackCursor:
             if hi in (0xA0, 0xD0):
                 self.pos += 2 if hi == 0xA0 else 1
                 continue
-            # 未知 status，停止该 track
+            # 未知 status，终止该轨
             self.pos = end
             return

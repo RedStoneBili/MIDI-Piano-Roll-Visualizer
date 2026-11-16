@@ -1,22 +1,5 @@
-# 修复了部分问题 by CHCAT1320
-# 添加英文支持 by CHCAT1320
-# 修复：轨道独立颜色、屏幕高度自适应、第一音符瞬移、无声、非标准 MIDI
-# 修复：下落速度改为由 MIDI tempo (BPM) 决定
-# 新增：中央C（无音符按下时）显示白底
-# 新增：header 音符数显示 已播放/总数，实时更新
-# 新增：按原始时间精确发送 control_change / program_change / pitchwheel /
-#       aftertouch / polytouch；note_on / note_off 带原始 channel
-# 修复：双 header 残留 → 两行分开精确刷新
-# 新增：实时效果信息（每通道 vol/pan/rev/sus/prog）
-# 新增：CC 摘要中文化；变速 MIDI 每个音符按自身 tempo 计算下落时间
-# 新增：缓解波浪 → 同步输出(DEC 2026) + 行级 diff + 颜色合并 + 定宽渲染
-# 性能优化：detect_chord 缓存 / 增量渲染 / 静态行预计算 / 字节级写
-# 新增：流式处理 → 生产者子进程 FastMidiReader 流式解析，主进程流式消费
-# 修复：卡住不动 / 画面高度 / 进度条 / 分轨颜色丢失
-# 修复：stage_msg 未初始化 NameError；Queue.get_nowait Windows 偶发阻塞
-# 新增：自适应宽度 + block_style(bg/fg) + 底部键盘整格填满 + 完整名称
-# 修复：所有列宽度必须一致 → 统一 base 宽度，右侧留白
 import mido
+import mido.backends.rtmidi
 import time
 import os
 import heapq
@@ -26,6 +9,7 @@ import shutil
 import multiprocessing
 import queue as queue_mod
 import gc
+import ctypes
 
 from fast_midi import FastMidiReader
 
@@ -34,6 +18,24 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 from collections import defaultdict, deque
 from typing import List, Dict, Tuple, Optional
 import json
+
+_WINMM_TIMER_ON = False
+try:
+    if sys.platform == 'win32':
+        _WINMM_TIMER_ON = ctypes.windll.winmm.timeBeginPeriod(1) == 0
+except Exception:
+    _WINMM_TIMER_ON = False
+
+
+def _release_winmm():
+    global _WINMM_TIMER_ON
+    if _WINMM_TIMER_ON:
+        try:
+            ctypes.windll.winmm.timeEndPeriod(1)
+        except Exception:
+            pass
+        _WINMM_TIMER_ON = False
+
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
 with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -85,22 +87,6 @@ MINOR_SCALES = [
 Q_ERRS = (queue_mod.Empty, EOFError, OSError, ValueError)
 
 
-def _safe_load_midi(path):
-    try:
-        return mido.MidiFile(path)
-    except Exception as e:
-        msg = str(e).lower()
-        if ('data byte' in msg or 'range' in msg or 'status' in msg
-                or 'invalid' in msg or 'unexpected' in msg):
-            try:
-                return mido.MidiFile(path, clip=True)
-            except TypeError:
-                raise e
-            except Exception:
-                raise
-        raise
-
-
 def _get_terminal_size_safe():
     try:
         s = shutil.get_terminal_size()
@@ -123,6 +109,27 @@ def _detect_sync_support():
     if 'kitty' in term or 'alacritty' in term or 'wezterm' in term:
         return True
     return True
+
+
+def _select_output_port_name():
+    """选择 MIDI 输出端口，返回端口名。"""
+    ports = mido.get_output_names()
+    if not ports:
+        print(LANG.get('no_midi_output', "没有找到可用的MIDI输出设备"))
+        return None
+    print(LANG.get('available_ports', "可用的MIDI输出设备:"))
+    for i, port in enumerate(ports):
+        print(f"{i}: {port}")
+    choice = input(LANG.get("select_port", "请选择设备编号(默认0): ")).strip()
+    if not choice:
+        return ports[0]
+    try:
+        idx = int(choice)
+    except ValueError:
+        idx = 0
+    if not (0 <= idx < len(ports)):
+        idx = 0
+    return ports[idx]
 
 
 DEFAULT_FG_PALETTE = [
@@ -287,7 +294,7 @@ def _producer_proc(midi_path, header_q, event_q, cfg):
         last_progress = 0
         PROGRESS_EVERY = 5000
 
-        note_stacks: Dict[Tuple[int, int, int], List] = {}
+        note_stacks: Dict[Tuple[int, int, int], deque] = {}
 
         for ev in reader.iter_events():
             t = ev['type']
@@ -297,14 +304,14 @@ def _producer_proc(midi_path, header_q, event_q, cfg):
             if t == 'note_on':
                 key = (ev['track'], ev['channel'], ev['note'])
                 tempo = ticks_to_tempo(abs_ticks)
-                note_stacks.setdefault(key, []).append(
+                note_stacks.setdefault(key, deque()).append(
                     (abs_sec, ev['velocity'], ev['channel'], tempo)
                 )
             elif t == 'note_off':
                 key = (ev['track'], ev['channel'], ev['note'])
                 stack = note_stacks.get(key)
                 if stack:
-                    on_sec, velocity, channel, tempo = stack.pop(0)
+                    on_sec, velocity, channel, tempo = stack.popleft()
                     duration = max(0.001, abs_sec - on_sec)
                     if min_note <= ev['note'] <= max_note:
                         drop_time = calc_drop_time(tempo)
@@ -438,6 +445,7 @@ class MIDIPlayer:
         self._sync_support: bool = _detect_sync_support()
         self._static_row_chars: List[List[str]] = []
         self._static_row_strs: List[str] = []
+        self._static_row_cells: List[List[Tuple[str, str]]] = []
         self.note_to_index: Dict[int, int] = {}
         self.cell_starts: List[int] = []
         self.cell_widths: List[int] = []
@@ -446,6 +454,14 @@ class MIDIPlayer:
         self._block_style = str(CONFIG.get('block_style', 'bg')).lower()
         if self._block_style not in ('fg', 'bg'):
             self._block_style = 'bg'
+        try:
+            self._trail_length = int(CONFIG.get('trail_length', 0))
+        except (ValueError, TypeError):
+            self._trail_length = 0
+        self._trail_by_note = bool(CONFIG.get('trail_by_note', False))
+        self._dual_line_interp = bool(CONFIG.get('dual_line_interp', False))
+        self._half_cell_notes = bool(CONFIG.get('half_cell_notes', True))
+        self._diag_enabled = bool(CONFIG.get('debug_info', False)) or bool(CONFIG.get('diag_frames', False))
         self._init_keyboard_layout()
 
     def _char_display_width(self, c):
@@ -540,15 +556,6 @@ class MIDIPlayer:
         except Exception:
             pass
 
-    def _show_progress(self, label, current, total, width=30):
-        if total <= 0:
-            return
-        filled = int(width * current / total)
-        bar = '█' * filled + '░' * (width - filled)
-        percent = current / total * 100
-        sys.stdout.write(f'\r\033[K{label} [{bar}] {current}/{total} ({percent:.1f}%)')
-        sys.stdout.flush()
-
     def _clear_progress(self):
         sys.stdout.write('\r\033[K')
         sys.stdout.flush()
@@ -573,23 +580,20 @@ class MIDIPlayer:
     def _get_key_bg(self, key_val) -> str:
         return self._color_map_bg.get(key_val, "\033[41m")
 
-    def _get_block_visual(self, block) -> Tuple[str, str]:
+    def _get_block_visual(self, block) -> Tuple[str, str, str]:
         key = block.get(self._color_key, 0)
         if self._block_style == 'bg':
-            color = self._color_map_bg.get(key, "\033[41m")
-            return color, ' '
+            head_color = self._color_map_bg.get(key, "\033[41m")
+            head_char = ' '
         else:
-            color = self._color_map_fg.get(key, "\033[91m")
-            return color, '█'
+            head_color = self._color_map_fg.get(key, "\033[91m")
+            head_char = '█'
+        tail_color = self._color_map_fg.get(key, "\033[91m")
+        return head_color, head_char, tail_color
 
     def _init_keyboard_layout(self):
-        """所有列宽度统一。
-        base = max(1, W // n)，display_width = base * n。
-        若终端宽度不是 n 的整数倍，右侧留少量空白，但保证每格等宽。
-        """
         n = self.max_note - self.min_note + 1
         W = max(self._term_width, n)
-
         base = max(1, W // n)
         display_width = base * n
 
@@ -637,6 +641,7 @@ class MIDIPlayer:
     def _build_static_rows(self):
         self._static_row_chars = []
         self._static_row_strs = []
+        self._static_row_cells = []
         for _ in range(self.display_height):
             chars = [' '] * self.display_width
             for center, _ in self.keyboard_positions:
@@ -644,27 +649,7 @@ class MIDIPlayer:
                     chars[center] = ' '
             self._static_row_chars.append(chars)
             self._static_row_strs.append(''.join(chars))
-
-    def select_output_port(self):
-        ports = mido.get_output_names()
-        if not ports:
-            print(LANG.get('no_midi_output', "没有找到可用的MIDI输出设备"))
-            return None
-        print(LANG.get('available_ports', "可用的MIDI输出设备:"))
-        for i, port in enumerate(ports):
-            print(f"{i}: {port}")
-        while True:
-            try:
-                choice = input(LANG.get("select_port", "请选择设备编号(默认0): "))
-                if not choice:
-                    choice = 0
-                else:
-                    choice = int(choice)
-                if 0 <= choice < len(ports):
-                    return mido.open_output(ports[choice])
-                print(LANG.get("invalid_choice", "无效的选择，请重试"))
-            except ValueError:
-                print(LANG.get("enter_number", "请输入数字"))
+            self._static_row_cells.append([('', ch) for ch in chars])
 
     def get_instrument_name(self, program: int) -> str:
         return instruments[program] if program < len(instruments) else f"乐器{program + 1}"
@@ -775,12 +760,15 @@ class MIDIPlayer:
         self._assign_colors(channels_used, tracks_used, [])
 
         if CONFIG.get('debug_info', False):
-            n_cells = max(1, self.max_note - self.min_note + 1)
             wasted = self._term_width - self.display_width
             print(f"[info] 终端 {term_cols}×{term_lines}, "
                   f"display_height={self.display_height}, display_width={self.display_width}, "
                   f"每格宽={self.cell_widths[0] if self.cell_widths else 0}, "
-                  f"右侧留白={wasted}, block_style={self._block_style}")
+                  f"右侧留白={wasted}, block_style={self._block_style}, "
+                  f"trail_length={self._trail_length}, "
+                  f"trail_by_note={self._trail_by_note}, "
+                  f"dual_line_interp={self._dual_line_interp}, "
+                  f"half_cell_notes={self._half_cell_notes}")
 
     _CHORD_DEFS = None
 
@@ -837,35 +825,80 @@ class MIDIPlayer:
             )
         return f"\033[1m{LANG.get('label', '和弦:')}\033[0m {LANG.get('none', '无')}\033[K"
 
-    def _render_row_with_blocks(self, line, row_blocks):
-        chars = list(self._static_row_chars[line])
-        colors = [''] * self.display_width
+    def _render_row_cells(self, line, heads, tails):
+        # heads 元素为 (note, color_key, half)，half 取 full/top/bottom
+        cells = list(self._static_row_cells[line])
+        for note, color in tails:
+            center = self.note_pos_map.get(note)
+            if center is not None and 0 <= center < self.display_width:
+                cells[center] = (color, '|')
 
-        for note, ansi_color, fill_char in row_blocks:
+        full_map = {}
+        top_map = {}
+        bottom_map = {}
+        for note, key, half in heads:
             i = self.note_to_index.get(note)
             if i is None:
                 continue
             start = self.cell_starts[i]
             w = self.cell_widths[i]
             end = min(start + w, self.display_width)
-            for k in range(start, end):
-                chars[k] = fill_char
-                colors[k] = ansi_color
+            if half == 'full':
+                for k in range(start, end):
+                    full_map[k] = key
+            elif half == 'top':
+                for k in range(start, end):
+                    top_map[k] = key
+            elif half == 'bottom':
+                for k in range(start, end):
+                    bottom_map[k] = key
 
+        fg = self._color_map_fg
+        bg = self._color_map_bg
+        for k in set(full_map) | set(top_map) | set(bottom_map):
+            if k in full_map:
+                key = full_map[k]
+                if self._block_style == 'bg':
+                    cells[k] = (bg.get(key, "\033[41m"), ' ')
+                else:
+                    cells[k] = (fg.get(key, "\033[91m"), '█')
+            elif k in top_map and k in bottom_map:
+                # 同格上下各有一个音符时合成 ▀：上半用前景、下半用背景
+                cells[k] = (
+                    fg.get(top_map[k], "\033[91m") + bg.get(bottom_map[k], "\033[41m"),
+                    '▀',
+                )
+            elif k in top_map:
+                cells[k] = (fg.get(top_map[k], "\033[91m"), '▀')
+            elif k in bottom_map:
+                cells[k] = (fg.get(bottom_map[k], "\033[91m"), '▄')
+        return cells
+
+    def _diff_row_cells(self, row, old_cells, new_cells):
         parts = []
-        last_color = ''
-        for col in range(self.display_width):
-            c = colors[col]
-            ch = chars[col]
-            if c != last_color:
-                if last_color:
-                    parts.append(COLOR_RESET)
-                if c:
-                    parts.append(c)
-                last_color = c
-            parts.append(ch)
-        if last_color:
-            parts.append(COLOR_RESET)
+        j = 0
+        n = len(new_cells)
+        base = f'\033[{self.SCROLL_START_ROW + row};'
+        while j < n:
+            if old_cells[j] == new_cells[j]:
+                j += 1
+                continue
+            start = j
+            buf = [COLOR_RESET]
+            last_color = ''
+            while j < n and old_cells[j] != new_cells[j]:
+                c, ch = new_cells[j]
+                if c != last_color:
+                    if last_color:
+                        buf.append(COLOR_RESET)
+                    if c:
+                        buf.append(c)
+                    last_color = c
+                buf.append(ch)
+                j += 1
+            if last_color:
+                buf.append(COLOR_RESET)
+            parts.append(f'{base}{start+1}H{"".join(buf)}')
         return ''.join(parts)
 
     def _render_keyboard_line(self, active_note_map):
@@ -948,11 +981,15 @@ class MIDIPlayer:
         meta_received = False
         meta_received_at = None
         start_time = None
+        start_perf = None
+        frame_idx = 0
         stage_msg = None
         self._reset_effect_state()
         ctrl_events: List[Dict] = []
         ctrl_idx = 0
-        note_buffer: deque = deque()
+        # 按 rel_spawn_time 建小顶堆，保证音符按起点顺序出队
+        note_buffer: List[Tuple[float, int, dict]] = []
+        _note_seq = 0
         producer_finished = False
 
         spawned: List[Dict] = []
@@ -960,9 +997,8 @@ class MIDIPlayer:
         played_count = 0
         pending_offs: List[Tuple[float, int, int]] = []
 
-        prev_scroll_lines: Optional[List[str]] = None
+        prev_row_cells: Dict[int, List[Tuple[str, str]]] = {}
         prev_kb_line: Optional[str] = None
-        prev_row_blocks: Dict[int, List[Tuple[int, str, str]]] = {}
         prev_notes_key: Optional[tuple] = None
         prev_chord_name = ""
         prev_chord_notes: List[str] = []
@@ -971,19 +1007,54 @@ class MIDIPlayer:
         prev_chord_line: Optional[str] = None
         prev_header_snapshot = None
 
-        refresh_rate = max(30.0, min(float(CONFIG.get('refresh_rate', 60)), 60.0))
+        refresh_rate = max(30.0, min(float(CONFIG.get('refresh_rate', 60)), 120.0))
         frame_interval = 1.0 / refresh_rate
+
+        diag_enabled = self._diag_enabled
+        diag_count = 0
+        diag_sum = 0.0
+        diag_sq_sum = 0.0
+        diag_max = 0.0
+        prev_frame_perf = time.perf_counter()
+        gc_was_enabled = gc.isenabled()
+
+        trail_len = self._trail_length
+        trail_by_note = self._trail_by_note
+        dual_line = self._dual_line_interp
+        half_cell = dual_line and self._half_cell_notes
+        H = self.display_height
 
         loop_start_time = time.time()
         print("\033[2J\033[H", end='')
         sys.stdout.flush()
+
+        def _emit_diag(force=False):
+            nonlocal diag_count, diag_sum, diag_sq_sum, diag_max
+            if not diag_enabled or diag_count == 0:
+                return
+            if not force and diag_count < 300:
+                return
+            mean = diag_sum / diag_count
+            var = diag_sq_sum / diag_count - mean * mean
+            std = (var ** 0.5) if var > 0 else 0.0
+            msg = (f"\r\033[K[diag] 帧: 平均{mean*1000:.2f}ms 标准差{std*1000:.2f}ms "
+                   f"最大{diag_max*1000:.2f}ms 目标{refresh_rate:.0f}fps\r")
+            try:
+                sys.stderr.buffer.write(msg.encode('utf-8'))
+                sys.stderr.flush()
+            except Exception:
+                pass
+            diag_count = 0
+            diag_sum = 0.0
+            diag_sq_sum = 0.0
+            diag_max = 0.0
 
         try:
             sys.stdout.write('\033[?25l')
             sys.stdout.flush()
 
             while True:
-                if start_time is not None:
+                if start_perf is not None:
                     drained = 0
                     while drained < 1000:
                         try:
@@ -994,7 +1065,9 @@ class MIDIPlayer:
                         if t == 'ctrls':
                             ctrl_events.extend(msg['batch'])
                         elif t == 'notes':
-                            note_buffer.extend(msg['batch'])
+                            for _b in msg['batch']:
+                                heapq.heappush(note_buffer, (_b['rel_spawn_time'], _note_seq, _b))
+                                _note_seq += 1
                         elif t == 'eof':
                             producer_finished = True
                         drained += 1
@@ -1012,6 +1085,7 @@ class MIDIPlayer:
                             return
                         elif ht == 'header':
                             self._apply_header_info(h)
+                            H = self.display_height
                             self.display_header()
                             header_displayed = True
                         elif ht == 'stage':
@@ -1067,7 +1141,7 @@ class MIDIPlayer:
                     time.sleep(0.05)
                     continue
 
-                if start_time is None:
+                if start_perf is None:
                     if meta_received:
                         if meta_received_at is None:
                             meta_received_at = time.time()
@@ -1082,6 +1156,13 @@ class MIDIPlayer:
                             time.sleep(0.03)
                             continue
                         start_time = time.time()
+                        start_perf = time.perf_counter()
+                        frame_idx = 0
+                        prev_frame_perf = start_perf
+                        gc.collect()
+                        gc_was_enabled = gc.isenabled()
+                        gc.disable()
+                        H = self.display_height
                         self._clear_progress()
                         line2 = self._build_header_line2(0, self._total_chord_count)
                         self._write_synced(
@@ -1115,7 +1196,8 @@ class MIDIPlayer:
                         time.sleep(0.03)
                         continue
 
-                now = time.time() - start_time
+                # 播放主循环
+                now = time.perf_counter() - start_perf
 
                 while ctrl_idx < len(ctrl_events):
                     e = ctrl_events[ctrl_idx]
@@ -1129,14 +1211,24 @@ class MIDIPlayer:
                     else:
                         break
 
-                while note_buffer and note_buffer[0]['rel_spawn_time'] <= now:
-                    spawned.append(note_buffer.popleft())
+                while note_buffer and note_buffer[0][0] <= now:
+                    _, _, blk = heapq.heappop(note_buffer)
+                    if trail_by_note:
+                        blk['trail_rows'] = max(0.0, blk['duration'] * H / blk['drop_time'])
+                        blk['use_trail_for_off'] = True
+                    else:
+                        blk['trail_rows'] = trail_len
+                        blk['use_trail_for_off'] = False
+                    blk['pos'] = 0.0
+                    spawned.append(blk)
 
                 new_spawned = []
                 for block in spawned:
                     dt = block['drop_time']
-                    progress = (now - block['rel_spawn_time']) / dt
-                    if progress >= 1.0:
+                    pos = (now - block['rel_spawn_time']) / dt * H
+
+                    if pos >= H and not block.get('triggered'):
+                        block['triggered'] = True
                         try:
                             out.send(mido.Message(
                                 'note_on',
@@ -1151,15 +1243,44 @@ class MIDIPlayer:
                             'track': block['track'],
                             'channel': block['channel'],
                         })
-                        heapq.heappush(
-                            pending_offs,
-                            (now + block['duration'], block['channel'], block['note'])
-                        )
                         played_count += 1
+                        if not block['use_trail_for_off']:
+                            heapq.heappush(
+                                pending_offs,
+                                (now + block['duration'], block['channel'], block['note'])
+                            )
+
+                    if block['use_trail_for_off']:
+                        tr = max(0.0, block['trail_rows'])
+                        if pos >= H + tr:
+                            if block.get('triggered'):
+                                try:
+                                    out.send(mido.Message('note_off',
+                                                          channel=block['channel'],
+                                                          note=block['note']))
+                                except Exception:
+                                    pass
+                                if block['note'] in active_note_map:
+                                    active_note_map[block['note']] = [
+                                        a for a in active_note_map[block['note']]
+                                        if not (a.get('track') == block['track'] and
+                                                a.get('channel') == block['channel'])
+                                    ]
+                                    if not active_note_map[block['note']]:
+                                        del active_note_map[block['note']]
+                            continue
                     else:
-                        block['steps'] = min(int(progress * self.display_height),
-                                             self.display_height - 1)
-                        new_spawned.append(block)
+                        if pos >= H:
+                            continue
+
+                    block['pos'] = pos
+                    if pos < H:
+                        block['steps'] = int(pos)
+                        block['frac'] = pos - int(pos)
+                    else:
+                        block['steps'] = H
+                        block['frac'] = 0.0
+                    new_spawned.append(block)
                 spawned = new_spawned
 
                 while pending_offs and pending_offs[0][0] <= now:
@@ -1174,32 +1295,60 @@ class MIDIPlayer:
                     if not active_note_map[note]:
                         del active_note_map[note]
 
-                row_blocks: Dict[int, List[Tuple[int, str, str]]] = {}
+                row_heads: Dict[int, List[Tuple[int, int, str]]] = {}
+                row_tails: Dict[int, List[Tuple[int, str]]] = {}
+
                 for block in spawned:
                     note = block['note']
-                    if note in self.note_to_index:
-                        line = block['steps']
-                        color, ch = self._get_block_visual(block)
-                        row_blocks.setdefault(line, []).append((note, color, ch))
+                    if note not in self.note_to_index:
+                        continue
+                    key = block.get(self._color_key, 0)
+                    pos = block['pos']
+                    steps = block['steps']
+                    frac = block['frac']
 
-                if prev_scroll_lines is None:
-                    scroll_lines = list(self._static_row_strs)
-                    for row, rb in row_blocks.items():
-                        scroll_lines[row] = self._render_row_with_blocks(row, rb)
-                else:
-                    scroll_lines = list(prev_scroll_lines)
-                    changed = set(prev_row_blocks.keys()) | set(row_blocks.keys())
-                    for row in changed:
-                        rb = row_blocks.get(row)
-                        if rb:
-                            scroll_lines[row] = self._render_row_with_blocks(row, rb)
+                    if pos < H:
+                        if half_cell:
+                            # 半格模式：上半用 ▀，下半用 ▄
+                            half = 'top' if frac < 0.5 else 'bottom'
+                            row_heads.setdefault(steps, []).append((note, key, half))
+                        elif dual_line and frac >= 0.5 and steps < H - 1:
+                            row_heads.setdefault(steps, []).append((note, key, 'bottom'))
+                            row_heads.setdefault(steps + 1, []).append((note, key, 'top'))
                         else:
-                            scroll_lines[row] = self._static_row_strs[row]
+                            row_heads.setdefault(steps, []).append((note, key, 'full'))
+
+                    trail_rows = block['trail_rows']
+                    if trail_rows == 0 or trail_rows is None:
+                        continue
+                    _, _, tail_color = self._get_block_visual(block)
+                    if trail_rows == -1:
+                        trail_top = 0
+                    else:
+                        trail_top = max(0, int(pos - trail_rows))
+                    if pos < H:
+                        trail_bot = int(pos) - 1
+                    else:
+                        trail_bot = H - 1
+                    trail_bot = min(H - 1, trail_bot)
+                    if trail_top <= trail_bot:
+                        for r in range(trail_top, trail_bot + 1):
+                            row_tails.setdefault(r, []).append((note, tail_color))
+
+                all_rows = set(row_heads.keys()) | set(row_tails.keys()) | set(prev_row_cells.keys())
+
+                new_row_cells: Dict[int, List[Tuple[str, str]]] = {}
+                for row in all_rows:
+                    h_list = row_heads.get(row, [])
+                    t_list = row_tails.get(row, [])
+                    if not h_list and not t_list:
+                        new_row_cells[row] = self._static_row_cells[row]
+                    else:
+                        new_row_cells[row] = self._render_row_cells(row, h_list, t_list)
 
                 kb_line = self._render_keyboard_line(active_note_map)
 
                 frame_parts = []
-                start_row = self.SCROLL_START_ROW
 
                 header_snapshot = (
                     played_count,
@@ -1215,17 +1364,16 @@ class MIDIPlayer:
                     )
                     prev_header_snapshot = header_snapshot
 
-                if prev_scroll_lines is None:
-                    for i, line in enumerate(scroll_lines):
-                        frame_parts.append(f'\033[{start_row + i};1H{line}')
-                else:
-                    for i, line in enumerate(scroll_lines):
-                        if prev_scroll_lines[i] != line:
-                            frame_parts.append(f'\033[{start_row + i};1H{line}')
+                for row in all_rows:
+                    old_cells = prev_row_cells.get(row, self._static_row_cells[row])
+                    new_cells = new_row_cells[row]
+                    if old_cells == new_cells:
+                        continue
+                    frame_parts.append(self._diff_row_cells(row, old_cells, new_cells))
 
                 if prev_kb_line != kb_line:
                     frame_parts.append(
-                        f'\033[{start_row + self.display_height};1H{kb_line}'
+                        f'\033[{self.SCROLL_START_ROW + H};1H{kb_line}'
                     )
 
                 notes_key = tuple(sorted(active_note_map.keys()))
@@ -1238,30 +1386,53 @@ class MIDIPlayer:
                 duration = now - prev_chord_time if prev_chord_name else 0
                 chord_line = self._build_chord_line(prev_chord_name, prev_chord_notes, duration)
                 if chord_line != prev_chord_line:
-                    chord_row = self.SCROLL_START_ROW + self.display_height + 1
+                    chord_row = self.SCROLL_START_ROW + H + 1
                     frame_parts.append(f'\033[{chord_row};1H{chord_line}')
                     prev_chord_line = chord_line
 
                 if frame_parts:
                     self._write_synced(''.join(frame_parts))
 
-                prev_scroll_lines = scroll_lines
+                prev_row_cells = new_row_cells
                 prev_kb_line = kb_line
-                prev_row_blocks = row_blocks
 
                 if (producer_finished and not spawned and not active_note_map
                         and not pending_offs and not note_buffer
                         and ctrl_idx >= len(ctrl_events)):
                     break
 
-                target = start_time + (int(max(now, 0) / frame_interval) + 1) * frame_interval
-                wait = target - time.time()
-                if wait > 0:
-                    time.sleep(wait)
+                if diag_enabled:
+                    now_perf = time.perf_counter()
+                    frame_dt = now_perf - prev_frame_perf
+                    diag_count += 1
+                    diag_sum += frame_dt
+                    diag_sq_sum += frame_dt * frame_dt
+                    if frame_dt > diag_max:
+                        diag_max = frame_dt
+                    prev_frame_perf = now_perf
+                    _emit_diag(force=False)
+
+                frame_idx += 1
+                target = start_perf + frame_idx * frame_interval
+                now_perf = time.perf_counter()
+                if now_perf < target - 0.001:
+                    time.sleep(target - now_perf - 0.001)
+                    while time.perf_counter() < target:
+                        pass
+                elif now_perf > target + frame_interval:
+                    frame_idx = int((now_perf - start_perf) / frame_interval) + 1
 
         except KeyboardInterrupt:
             print('\n' + LANG.get('playback_stopped', '播放停止'))
         finally:
+            _emit_diag(force=True)
+            if diag_enabled:
+                try:
+                    sys.stderr.buffer.write(b"\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            gc.enable()
             try:
                 producer.terminate()
                 producer.join(timeout=0.5)
@@ -1284,27 +1455,16 @@ class MIDIPlayer:
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    player = MIDIPlayer()
-    print("\033[2J\033[H")
-    file_path = input(LANG.get("enter_midi_path", "请输入MIDI文件路径:")).strip()
-    ports = mido.get_output_names()
-    if not ports:
-        print(LANG.get("no_midi_output", "没有找到可用的MIDI输出设备"))
-    else:
-        print(LANG.get("select_port", "请选择设备编号(默认0):"))
-        for i, port in enumerate(ports):
-            print(f"{i}: {port}")
-        choice = input(LANG.get("select_port", "请输入设备编号:")).strip()
-        print("\033[?25l\033[2J\033[H")
-        if not choice:
-            choice = 0
-        else:
+    try:
+        player = MIDIPlayer()
+        print("\033[2J\033[H")
+        file_path = input(LANG.get("enter_midi_path", "请输入MIDI文件路径:")).strip()
+        output_port = _select_output_port_name()
+        if output_port is not None:
+            print("\033[?25l\033[2J\033[H")
             try:
-                choice = int(choice)
-            except ValueError:
-                choice = 0
-        output_port = ports[choice] if 0 <= choice < len(ports) else ports[0]
-        try:
-            player.play_midi_loop(file_path, output_port)
-        finally:
-            print('\033[?25h', end='')
+                player.play_midi_loop(file_path, output_port)
+            finally:
+                print('\033[?25h', end='')
+    finally:
+        _release_winmm()
