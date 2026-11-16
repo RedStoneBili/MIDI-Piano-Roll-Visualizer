@@ -57,6 +57,7 @@ struct Config {
     trail_by_note: bool,
     dual_line_interp: bool,
     half_cell_notes: bool,
+    max_nps: i64,
     sync_output: Option<bool>,
     debug_info: bool,
     default_tempo: u32,
@@ -84,6 +85,7 @@ impl Config {
             trail_by_note: jbool(v, "trail_by_note", false),
             dual_line_interp: jbool(v, "dual_line_interp", false),
             half_cell_notes: jbool(v, "half_cell_notes", true),
+            max_nps: v.get("max_notes_per_second").and_then(|x| x.as_i64()).unwrap_or(0),
             sync_output: v.get("sync_output").and_then(|x| x.as_bool()),
             debug_info: jbool(v, "debug_info", false),
             default_tempo: ju32(v, "default_tempo", 500000),
@@ -249,6 +251,7 @@ struct NoteBlock {
     steps: i32,
     frac: f64,
     triggered: bool,
+    id: u64,
 }
 
 #[derive(Clone)]
@@ -388,6 +391,7 @@ fn run_producer(path: &str, tx: &Sender<Msg>, pcfg: &ProducerCfg) -> Result<(), 
                                 steps: 0,
                                 frac: 0.0,
                                 triggered: false,
+                                id: 0,
                             });
                             if note_batch.len() >= 100 {
                                 let b = std::mem::take(&mut note_batch);
@@ -1010,6 +1014,8 @@ fn play_loop(mut player: Player, mut out: midir::MidiOutputConnection, midi_path
     let mut meta_at: Option<Instant> = None;
     let mut start: Option<Instant> = None;
     let mut producer_finished = false;
+    let mut bucket_idx: i64 = -1;
+    let mut allowed: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut frame_idx: i64 = 0;
     let mut stage: Option<(String, u64, u64)> = None;
     let mut ctrl_events: Vec<CtrlBlock> = Vec::new();
@@ -1044,7 +1050,7 @@ fn play_loop(mut player: Player, mut out: midir::MidiOutputConnection, midi_path
             match rx.try_recv() {
                 Ok(Msg::Ctrls(b)) => { ctrl_events.extend(b); }
                 Ok(Msg::Notes(b)) => {
-                    for blk in b { heap.push(HeapNote { rel: blk.rel_spawn, seq, blk }); seq += 1; }
+                    for mut blk in b { blk.id = seq; heap.push(HeapNote { rel: blk.rel_spawn, seq, blk }); seq += 1; }
                 }
                 Ok(Msg::Eof) => { producer_finished = true; }
                 Ok(Msg::Stage { name, cur, total }) => { stage = Some((name, cur, total)); }
@@ -1117,6 +1123,32 @@ fn play_loop(mut player: Player, mut out: midir::MidiOutputConnection, midi_path
 
         let s = start.unwrap();
         let now = s.elapsed().as_secs_f64();
+
+        if player.cfg.max_nps != 0 {
+            let bucket = now.floor() as i64;
+            if bucket != bucket_idx {
+                bucket_idx = bucket;
+                if player.cfg.max_nps > 0 {
+                    let mut cand: Vec<(u8, u64)> = Vec::new();
+                    for blk in &spawned {
+                        if blk.triggered { continue; }
+                        let tt = blk.rel_spawn + blk.drop_time;
+                        if tt < (bucket + 1) as f64 { cand.push((blk.velocity, blk.id)); }
+                    }
+                    for hn in heap.iter() {
+                        let blk = &hn.blk;
+                        let tt = blk.rel_spawn + blk.drop_time;
+                        if tt < (bucket + 1) as f64 { cand.push((blk.velocity, blk.id)); }
+                    }
+                    cand.sort_by(|a, b| b.0.cmp(&a.0));
+                    allowed.clear();
+                    for &(_, id) in cand.iter().take(player.cfg.max_nps as usize) { allowed.insert(id); }
+                } else {
+                    allowed.clear();
+                }
+            }
+        }
+
         let h = player.display_height;
         let hf = h as f64;
         let dual_line = player.cfg.dual_line_interp;
@@ -1159,12 +1191,17 @@ fn play_loop(mut player: Player, mut out: midir::MidiOutputConnection, midi_path
 
             if pos >= hf && !blk.triggered {
                 blk.triggered = true;
-                let _ = out.send(&[0x90 | (blk.channel & 0x0F), blk.note, blk.velocity]);
+                let play = if player.cfg.max_nps == 0 { true }
+                    else if player.cfg.max_nps > 0 { allowed.contains(&blk.id) }
+                    else { false };
+                if play {
+                    let _ = out.send(&[0x90 | (blk.channel & 0x0F), blk.note, blk.velocity]);
+                    if !blk.use_trail_for_off {
+                        pending.push(Reverse((OF(now + blk.duration), blk.channel, blk.note)));
+                    }
+                }
                 active.entry(blk.note).or_default().push(Active { end_time: now + blk.duration, track: blk.track, channel: blk.channel, key });
                 played += 1;
-                if !blk.use_trail_for_off {
-                    pending.push(Reverse((OF(now + blk.duration), blk.channel, blk.note)));
-                }
             }
 
             if blk.use_trail_for_off {
