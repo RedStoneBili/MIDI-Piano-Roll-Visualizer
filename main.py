@@ -461,6 +461,10 @@ class MIDIPlayer:
         self._trail_by_note = bool(CONFIG.get('trail_by_note', False))
         self._dual_line_interp = bool(CONFIG.get('dual_line_interp', False))
         self._half_cell_notes = bool(CONFIG.get('half_cell_notes', True))
+        try:
+            self._max_nps = int(CONFIG.get('max_notes_per_second', 0))
+        except (ValueError, TypeError):
+            self._max_nps = 0
         self._diag_enabled = bool(CONFIG.get('debug_info', False)) or bool(CONFIG.get('diag_frames', False))
         self._init_keyboard_layout()
 
@@ -996,6 +1000,8 @@ class MIDIPlayer:
         active_note_map: Dict[int, List[Dict]] = defaultdict(list)
         played_count = 0
         pending_offs: List[Tuple[float, int, int]] = []
+        bucket_idx = -1
+        allowed_ids = set()
 
         prev_row_cells: Dict[int, List[Tuple[str, str]]] = {}
         prev_kb_line: Optional[str] = None
@@ -1066,6 +1072,7 @@ class MIDIPlayer:
                             ctrl_events.extend(msg['batch'])
                         elif t == 'notes':
                             for _b in msg['batch']:
+                                _b['id'] = _note_seq
                                 heapq.heappush(note_buffer, (_b['rel_spawn_time'], _note_seq, _b))
                                 _note_seq += 1
                         elif t == 'eof':
@@ -1199,6 +1206,28 @@ class MIDIPlayer:
                 # 播放主循环
                 now = time.perf_counter() - start_perf
 
+                if self._max_nps != 0:
+                    _bucket = int(now)
+                    if _bucket != bucket_idx:
+                        bucket_idx = _bucket
+                        if self._max_nps > 0:
+                            _cand = []
+                            for _b in spawned:
+                                if _b.get('triggered'):
+                                    continue
+                                _tt = _b['rel_spawn_time'] + _b['drop_time']
+                                if _tt < _bucket + 1:
+                                    _cand.append((_b['velocity'], _b.get('id')))
+                            for _item in note_buffer:
+                                _b = _item[2]
+                                _tt = _b['rel_spawn_time'] + _b['drop_time']
+                                if _tt < _bucket + 1:
+                                    _cand.append((_b['velocity'], _b.get('id')))
+                            _cand.sort(key=lambda x: -x[0])
+                            allowed_ids = set(_i for _, _i in _cand[:self._max_nps])
+                        else:
+                            allowed_ids = set()
+
                 while ctrl_idx < len(ctrl_events):
                     e = ctrl_events[ctrl_idx]
                     if now >= e['rel_time']:
@@ -1229,26 +1258,33 @@ class MIDIPlayer:
 
                     if pos >= H and not block.get('triggered'):
                         block['triggered'] = True
-                        try:
-                            out.send(mido.Message(
-                                'note_on',
-                                channel=block['channel'],
-                                note=block['note'],
-                                velocity=block['velocity'],
-                            ))
-                        except Exception:
-                            pass
+                        if self._max_nps == 0:
+                            _play = True
+                        elif self._max_nps > 0:
+                            _play = block.get('id') in allowed_ids
+                        else:
+                            _play = False
+                        if _play:
+                            try:
+                                out.send(mido.Message(
+                                    'note_on',
+                                    channel=block['channel'],
+                                    note=block['note'],
+                                    velocity=block['velocity'],
+                                ))
+                            except Exception:
+                                pass
+                            if not block['use_trail_for_off']:
+                                heapq.heappush(
+                                    pending_offs,
+                                    (now + block['duration'], block['channel'], block['note'])
+                                )
                         active_note_map[block['note']].append({
                             'end_time': now + block['duration'],
                             'track': block['track'],
                             'channel': block['channel'],
                         })
                         played_count += 1
-                        if not block['use_trail_for_off']:
-                            heapq.heappush(
-                                pending_offs,
-                                (now + block['duration'], block['channel'], block['note'])
-                            )
 
                     if block['use_trail_for_off']:
                         tr = max(0.0, block['trail_rows'])

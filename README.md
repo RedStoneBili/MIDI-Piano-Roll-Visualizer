@@ -1,5 +1,7 @@
 # 🎹 MIDI Piano Roll Visualizer / MIDI 钢琴卷帘可视化播放器  
 
+> 说明：Python 版已停止维护，后续版本见 Rust 版（分支 2.0）。
+
 ![Screenshot](效果图.jpg)  
 
 A Python-based MIDI player with piano roll visualization that displays falling notes in real-time, with chord detection and music theory analysis.  
