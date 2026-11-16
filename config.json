@@ -1,0 +1,23 @@
+{
+  "language": "lang/zh-CN.json",
+  "note_names": [ "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" ],
+  "color_reset": "\u001b[0m",
+  "color_clear": "\u001b[H",
+  "color_bg_white": "\u001b[47m",
+  "default_tempo": 500000,
+  "ticks_per_beat": 480,
+  "highlight_middle_c": true,
+  "middle_c_bg": "\u001b[107m",
+  "color_by": "auto",
+  "beats_for_drop": 2.0,
+  "drop_follows_tempo": true,
+  "min_drop_time_seconds": 0.15,
+  "refresh_rate": 60,
+  "block_style": "fg",
+  "trail_length": 0,
+  "trail_by_note": true,
+  "dual_line_interp": false,
+  "half_cell_notes": true,
+  "sync_output": false,
+  "debug_info": false
+}
