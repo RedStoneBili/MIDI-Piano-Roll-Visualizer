@@ -1,5 +1,120 @@
 {
+  "beats_for_drop": 4.0,
+  "block_style": "fg",
+  "climax": {
+    "bucket": 0.5,
+    "enabled": true,
+    "exclude_edges": 3.0,
+    "min_gap": 8.0,
+    "min_median_ratio": 1.3,
+    "min_std": 1.0,
+    "smooth": 2.0,
+    "top_n": 3,
+    "weights": {
+      "density": 0.35,
+      "harmony": 0.1,
+      "pitch": 0.15,
+      "range": 0.1,
+      "tempo": 0.05,
+      "velocity": 0.25
+    }
+  },
+  "color_bg_white": "\u001b[47m",
+  "color_by": "auto",
+  "color_clear": "\u001b[H",
+  "color_reset": "\u001b[0m",
+  "debug_info": false,
+  "default_tempo": 500000,
+  "drop_follows_tempo": true,
+  "dual_line_interp": true,
+  "fx": {
+    "effects": {
+      "attack_flash": {
+        "enabled": true,
+        "frames": 3,
+        "keyboard": false
+      },
+      "aurora": {
+        "enabled": false,
+        "speed": 1
+      },
+      "beat_grid": {
+        "bar_char": "─",
+        "beat_char": "·",
+        "beat_full_width": false,
+        "beat_unit": 4,
+        "beats_per_bar": 4,
+        "color": "\u001b[90m",
+        "enabled": true
+      },
+      "chord_degrees": {
+        "enabled": true
+      },
+      "climax_shake": {
+        "duration": 0.5,
+        "enabled": true,
+        "flash": true,
+        "intensity": 2
+      },
+      "fireworks": {
+        "enabled": false,
+        "min_velocity": 100
+      },
+      "key_ripple": {
+        "enabled": false,
+        "frames": 6,
+        "radius": 3
+      },
+      "mode_palette": {
+        "enabled": true
+      },
+      "particles": {
+        "density": 20,
+        "enabled": false
+      },
+      "percussion_mark": {
+        "color": "\u001b[93m",
+        "enabled": true,
+        "glyph": "◆"
+      },
+      "screen_flash": {
+        "enabled": false,
+        "on_bar": true
+      },
+      "shockwave": {
+        "beats_per_bar": 4,
+        "duration": 2.2,
+        "enabled": false,
+        "radius": 0,
+        "thickness": 1,
+        "use_256": true
+      },
+      "theme": {
+        "enabled": true,
+        "name": "neon"
+      },
+      "trail_fade": {
+        "chars": "█▓▒░",
+        "enabled": false
+      },
+      "velocity_glow": {
+        "enabled": true,
+        "threshold": 100
+      }
+    },
+    "enabled": true,
+    "level": 1
+  },
+  "half_cell_notes": true,
+  "highlight_middle_c": true,
+  "keyboard_highlight": "bg",
   "language": "lang/zh-CN.json",
+  "max_note": 90,
+  "max_notes_per_second": 0,
+  "middle_c_bg": "\u001b[107m",
+  "midi_queue_size": 0,
+  "min_drop_time_seconds": 0.15,
+  "min_note": 40,
   "note_names": [
     "C",
     "C#",
@@ -14,24 +129,14 @@
     "A#",
     "B"
   ],
-  "color_reset": "\u001b[0m",
-  "color_clear": "\u001b[H",
-  "color_bg_white": "\u001b[47m",
-  "default_tempo": 500000,
-  "ticks_per_beat": 480,
-  "highlight_middle_c": true,
-  "middle_c_bg": "\u001b[107m",
-  "color_by": "auto",
-  "beats_for_drop": 4.0,
-  "drop_follows_tempo": true,
-  "min_drop_time_seconds": 0.15,
-  "refresh_rate": 120,
-  "block_style": "fg",
-  "trail_length": 0,
-  "trail_by_note": true,
-  "dual_line_interp": true,
-  "half_cell_notes": true,
-  "max_notes_per_second": 0,
+  "playlist": {
+    "mode": "order",
+    "recursive": false
+  },
+  "progress_bar": true,
+  "refresh_rate": 60.0,
   "sync_output": true,
-  "debug_info": false
+  "ticks_per_beat": 480,
+  "trail_by_note": true,
+  "trail_length": 0
 }

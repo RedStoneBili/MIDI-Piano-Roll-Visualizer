@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "midi-piano-roll"
-version = "0.1.0"
+version = "2.0.1"
 dependencies = [
  "crossbeam-channel",
  "memmap2",

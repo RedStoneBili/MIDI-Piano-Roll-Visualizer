@@ -1,6 +1,6 @@
 [package]
 name = "midi-piano-roll"
-version = "0.1.0"
+version = "2.0.1"
 edition = "2021"
 
 [dependencies]
@@ -13,7 +13,11 @@ terminal_size = "0.4.4"
 unicode-width = "0.2.3"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Media"] }
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Media",
+  "Win32_Foundation",
+  "Win32_System_Console",
+] }
 
 [profile.release]
 opt-level = 3
